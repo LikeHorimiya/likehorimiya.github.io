@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speech to Translation - Chrome Built-in</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a1a;
+            color: white;
+            padding: 20px;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .controls {
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        select, button {
+            padding: 8px;
+            font-size: 16px;
+            border-radius: 4px;
+            border: none;
+            cursor: pointer;
+        }
+
+        button:disabled {
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+
+        .model-download-area {
+            margin: 10px 0;
+            display: none;
+        }
+
+        .download-status-area {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+            display: none;
+        }
+
+        .model-queue-status {
+            padding: 5px 10px;
+            border-radius: 12px;
+            font-size: 14px;
+            margin-left: 10px;
+        }
+
+        .display-area {
+            background: #2c2c2c;
+            padding: 15px;
+            border-radius: 8px;
+        }
+
+        .text-line {
+            margin-bottom: 2px;
+            min-height: 32px;
+            padding: 8px 12px;
+            background: #2c2c2c;
+            overflow: hidden;
+            white-space: nowrap;
+            position: relative;
+        }
+
+        .text-line.scrolling .text-content {
+            display: inline-block;
+            animation: marquee 15s linear infinite;
+        }
+
+        @keyframes marquee {
+            0% { transform: translateX(100%); }
+            100% { transform: translateX(-100%); }
+        }
+
+        .interim { color: #ff69b4; font-size: 18px; line-height: 1.1; }
+        .final { color: #ffffff; font-size: 18px; font-weight: 500; line-height: 1.1; }
+        .translation { color: #87ceeb; font-size: 18px; line-height: 1.1; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="controls">
+            <select id="recog">
+                <option value="ja-JP">日本語</option>
+                <option value="en-US">英語</option>
+                <option value="zh-CN">中国語</option>
+            </select>
+            <select id="trans">
+                <option value="none">翻訳なし</option>
+                <option value="en">英語</option>
+                <option value="zh">中国語</option>
+                <option value="es">スペイン語</option>
+            </select>
+            <select id="presetSelect">
+                <option value="default">デフォルト</option>
+                <option value="ja-en">日本語→英語</option>
+                <option value="en-zh">英語→中国語</option>
+            </select>
+        </div>
+        <div class="model-download-area" id="modelDownloadArea">
+            <button id="preloadModelBtn" disabled>📥 モデルをダウンロード</button>
+            <span id="modelStatusText"></span>
+            <span id="modelQueueStatus" class="model-queue-status"></span>
+        </div>
+        <div class="download-status-area" id="downloadStatusArea">
+            <span id="downloadStatusText"></span>
+        </div>
+        <div class="display-area">
+            <div class="text-line interim" id="interim">
+                <span class="text-content"></span>
+            </div>
+            <div class="text-line final" id="final">
+                <span class="text-content"></span>
+            </div>
+            <div class="text-line translation" id="translation">
+                <span class="text-content"></span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let recognition = null;
+        let translator = null;
+        let isRecognizing = false;
+        let interimClearTimer = null;
+        let finalClearTimer = null;
+        let translationClearTimer = null;
+        let currentTranslationPair = null;
+        let pendingModels = [];
+
+        const interimEl = document.getElementById('interim');
+        const finalEl = document.getElementById('final');
+        const translationEl = document.getElementById('translation');
+        const recogSelect = document.getElementById('recog');
+        const transSelect = document.getElementById('trans');
+        const presetSelect = document.getElementById('presetSelect');
+
+        function getLanguageDisplayName(langCode) {
+            const langMap = {
+                'ja-JP': '日本語', 'en-US': '英語', 'zh-CN': '中国語',
+                'en': '英語', 'zh': '中国語', 'es': 'スペイン語'
+            };
+            return langMap[langCode] || langCode;
+        }
+
+        async function initTranslator(sourceLang, targetLang) {
+            console.log('[v2] Checking Translator API availability...');
+            console.log('[v2] Translator exists:', 'Translator' in self);
+
+            if (!('Translator' in self)) {
+                console.error('[v2] Translator APIがサポートされていません。');
+                return null;
+            }
+
+            try {
+                const sourceLanguage = sourceLang.split('-')[0];
+                const translatorInstance = await Translator.create({
+                    sourceLanguage: sourceLanguage,
+                    targetLanguage: targetLang,
+                    monitor: (m) => {
+                        m.addEventListener('downloadprogress', (e) => {
+                            const progress = (e.loaded / e.total) * 100;
+                            console.log(`[v2] ダウンロード進捗: ${progress.toFixed(2)}%`);
+                            const statusArea = document.getElementById('downloadStatusArea');
+                            const statusText = document.getElementById('downloadStatusText');
+                            if (statusArea && statusText) {
+                                statusText.innerHTML = `🔄 ダウンロード中... ${progress.toFixed(0)}%`;
+                                statusArea.style.display = 'block';
+                                statusArea.style.background = `linear-gradient(90deg, #4CAF50 ${progress}%, #ff6b6b ${progress}%)`;
+                            }
+                        });
+                    }
+                });
+                console.log('[v2] Translator初期化成功');
+                return translatorInstance;
+            } catch (error) {
+                console.error('[v2] 翻訳機能の初期化に失敗しました:', error);
+                return null;
+            }
+        }
+
+        async function translateText(text) {
+            if (!text || !translator) return '';
+            try {
+                const result = await translator.translate(text);
+                console.log('[v2] 翻訳成功:', text, '->', result);
+                return result;
+            } catch (error) {
+                console.error('[v2] 翻訳エラー:', error);
+                return '';
+            }
+        }
+
+        function checkOverflow(element) {
+            const textContent = element.querySelector('.text-content');
+            if (textContent.scrollWidth > element.clientWidth) {
+                element.classList.add('scrolling');
+            } else {
+                element.classList.remove('scrolling');
+            }
+        }
+
+        function updateQueueStatus() {
+            const queueStatus = document.getElementById('modelQueueStatus');
+            if (queueStatus) {
+                if (pendingModels.length > 0) {
+                    queueStatus.style.display = 'inline-block';
+                    queueStatus.textContent = `📦 残り${pendingModels.length}個`;
+                    queueStatus.style.background = pendingModels.length === 1 ? 'rgba(76, 175, 80, 0.1)' :
+                        pendingModels.length <= 3 ? 'rgba(255, 193, 7, 0.1)' : 'rgba(244, 67, 54, 0.1)';
+                    queueStatus.style.color = pendingModels.length === 1 ? '#4CAF50' :
+                        pendingModels.length <= 3 ? '#f57c00' : '#d32f2f';
+                } else {
+                    queueStatus.style.display = 'none';
+                }
+            }
+        }
+
+        async function checkTranslationModel(event = null) {
+            if (!('Translator' in self)) {
+                console.error('[v2] Translator APIがサポートされていません。この機能はChromeでのみ利用可能です。');
+                const modelArea = document.getElementById('modelDownloadArea');
+                const modelStatus = document.getElementById('modelStatusText');
+                const transSelectEl = document.getElementById('trans');
+                if (modelArea) modelArea.style.display = 'none';
+                if (modelStatus) modelStatus.textContent = '';
+                if (transSelectEl) {
+                    transSelectEl.disabled = true;
+                    transSelectEl.value = 'none';
+                    transSelectEl.title = '翻訳機能は利用できません';
+                }
+                currentTranslationPair = null;
+                pendingModels = [];
+                updateQueueStatus();
+                return;
+            }
+
+            const sourceLang = recogSelect.value;
+            const targetLang = transSelect.value;
+            const modelArea = document.getElementById('modelDownloadArea');
+            const modelBtn = document.getElementById('preloadModelBtn');
+            const modelStatus = document.getElementById('modelStatusText');
+
+            if (targetLang === 'none' || sourceLang.split('-')[0] === targetLang) {
+                currentTranslationPair = null;
+                if (modelArea) modelArea.style.display = 'none';
+                return;
+            }
+
+            try {
+                const normalizedSource = sourceLang.split('-')[0];
+                const normalizedTarget = targetLang;
+                const targetLangName = getLanguageDisplayName(targetLang);
+
+                const availability = await Translator.availability({
+                    sourceLanguage: normalizedSource,
+                    targetLanguage: normalizedTarget
+                });
+
+                console.log(`[v2] 翻訳モデル状態: ${sourceLang} → ${targetLang} = ${availability}`);
+
+                if (availability === 'downloadable') {
+                    const isDirectUserGesture = event && event.type === 'change';
+                    if (isDirectUserGesture) {
+                        console.log(`[v2] 自動ダウンロード開始: ${targetLangName}`);
+                        translator = await initTranslator(sourceLang, targetLang);
+                    } else {
+                        const exists = pendingModels.some(m =>
+                            m.sourceLang === normalizedSource && m.targetLang === normalizedTarget);
+                        if (!exists) {
+                            pendingModels.push({
+                                sourceLang: normalizedSource,
+                                targetLang: normalizedTarget,
+                                langName: targetLangName
+                            });
+                            updateQueueStatus();
+                        }
+                        if (pendingModels.length > 0 && modelArea && modelBtn) {
+                            const firstModel = pendingModels[0];
+                            modelArea.style.display = 'block';
+                            modelBtn.style.display = 'inline-block';
+                            modelBtn.disabled = false;
+                            modelBtn.style.background = '#ff6b6b';
+                            modelBtn.innerHTML = `📥 ${firstModel.langName}モデルをダウンロード`;
+                            modelStatus.textContent = '音声認識言語変更後は手動ダウンロードが必要です';
+                            modelStatus.style.color = '#333';
+                            currentTranslationPair = {
+                                source: sourceLang,
+                                target: targetLang,
+                                normalizedSource: normalizedSource,
+                                normalizedTarget: normalizedTarget
+                            };
+                        }
+                    }
+                } else if (availability === 'available') {
+                    console.log(`[v2] 翻訳モデルは既にダウンロード済み: ${targetLangName}`);
+                    if (pendingModels.length === 0 && modelArea) {
+                        modelArea.style.display = 'none';
+                    }
+                    translator = await initTranslator(sourceLang, targetLang);
+                } else {
+                    console.log(`[v2] 翻訳モデルは利用不可: ${targetLangName} (${availability})`);
+                    if (pendingModels.length === 0 && modelArea) {
+                        modelArea.style.display = 'none';
+                    }
+                }
+            } catch (error) {
+                console.error('[v2] 翻訳可能性チェックエラー:', error);
+                if (modelArea && modelStatus) {
+                    modelArea.style.display = 'block';
+                    modelStatus.textContent = '❌ 翻訳モデルのチェックに失敗しました: ' + error.message;
+                    modelStatus.style.color = '#f44336';
+                }
+            }
+        }
+
+        async function preloadTranslationModel() {
+            let modelToDownload = pendingModels.length > 0 ? pendingModels[0] : currentTranslationPair;
+            if (!modelToDownload) return;
+
+            const modelBtn = document.getElementById('preloadModelBtn');
+            const modelStatus = document.getElementById('modelStatusText');
+            const targetLangName = modelToDownload.langName || getLanguageDisplayName(modelToDownload.target);
+
+            modelBtn.disabled = true;
+            modelBtn.innerHTML = `📥 ${targetLangName}をダウンロード準備中...`;
+            modelStatus.textContent = '';
+
+            try {
+                translator = await initTranslator(modelToDownload.source || modelToDownload.sourceLang, modelToDownload.target || modelToDownload.targetLang);
+                if (translator) {
+                    if (pendingModels.length > 0) {
+                        pendingModels.shift();
+                        updateQueueStatus();
+                    }
+                    if (pendingModels.length > 0) {
+                        const nextModel = pendingModels[0];
+                        modelBtn.disabled = false;
+                        modelBtn.style.background = '#ff6b6b';
+                        modelBtn.innerHTML = `📥 ${nextModel.langName}モデルをダウンロード`;
+                        modelStatus.textContent = `✅ ${targetLangName}完了！`;
+                        modelStatus.style.color = '#4CAF50';
+                        currentTranslationPair = {
+                            normalizedSource: nextModel.sourceLang,
+                            normalizedTarget: nextModel.targetLang,
+                            targetLangName: nextModel.langName
+                        };
+                    } else {
+                        modelBtn.style.display = 'none';
+                        modelStatus.textContent = '✅ 全モデルのダウンロード完了！';
+                        modelStatus.style.color = '#4CAF50';
+                        setTimeout(() => {
+                            document.getElementById('modelDownloadArea').style.display = 'none';
+                        }, 3000);
+                        currentTranslationPair = null;
+                    }
+                } else {
+                    throw new Error('翻訳モデルの初期化に失敗');
+                }
+            } catch (error) {
+                console.error('[v2] 事前ダウンロードエラー:', error);
+                modelBtn.disabled = false;
+                modelBtn.style.background = '#ff6b6b';
+                modelBtn.innerHTML = `📥 ${targetLangName}モデルをダウンロード`;
+                modelStatus.textContent = '❌ エラー: ' + error.message;
+                modelStatus.style.color = '#f44336';
+            }
+        }
+
+        function initSpeechRecognition() {
+            if (!('webkitSpeechRecognition' in window)) {
+                console.error('[v2] 音声認識がサポートされていません。');
+                return null;
+            }
+
+            recognition = new webkitSpeechRecognition();
+            recognition.lang = recogSelect.value;
+            recognition.continuous = true;
+            recognition.interimResults = true;
+
+            recognition.onstart = () => {
+                isRecognizing = true;
+                console.log('[v2] 音声認識開始成功');
+            };
+
+            recognition.onend = () => {
+                console.log('[v2] 音声認識終了');
+                isRecognizing = false;
+                if (recognition && !isRecognizing) {
+                    setTimeout(() => {
+                        if (recognition && !isRecognizing) {
+                            try {
+                                recognition.start();
+                                console.log('[v2] 音声認識再起動');
+                            } catch (error) {
+                                console.error('[v2] 音声認識再起動エラー:', error);
+                            }
+                        }
+                    }, 1500);
+                }
+            };
+
+            recognition.onerror = (event) => {
+                console.error('[v2] 音声認識エラー:', event.error);
+                if (event.error === 'not-allowed') {
+                    alert('マイクの許可が必要です');
+                } else if (event.error !== 'no-speech') {
+                    isRecognizing = false;
+                    setTimeout(() => {
+                        if (recognition && !isRecognizing) {
+                            try {
+                                recognition.start();
+                                console.log('[v2] 音声認識エラー後の再起動');
+                            } catch (error) {
+                                console.error('[v2] 音声認識再起動エラー:', error);
+                            }
+                        }
+                    }, 1500);
+                }
+            };
+
+            recognition.onresult = async (event) => {
+                console.log('[v2] 音声認識結果受信');
+                let interimTranscript = '';
+                let finalTranscript = '';
+
+                for (let i = event.resultIndex; i < event.results.length; i++) {
+                    const transcript = event.results[i][0].transcript;
+                    if (event.results[i].isFinal) {
+                        finalTranscript += transcript;
+                    } else {
+                        interimTranscript += transcript;
+                    }
+                }
+
+                if (interimTranscript) {
+                    console.log('[v2] 暫定テキスト:', interimTranscript);
+                    if (interimClearTimer) clearTimeout(interimClearTimer);
+                    const interimContent = interimEl.querySelector('.text-content');
+                    interimContent.textContent = interimTranscript;
+                    checkOverflow(interimEl);
+                }
+
+                if (finalTranscript) {
+                    console.log('[v2] 確定テキスト:', finalTranscript);
+                    if (interimClearTimer) clearTimeout(interimClearTimer);
+                    interimClearTimer = setTimeout(() => {
+                        interimEl.querySelector('.text-content').textContent = '';
+                        interimEl.classList.remove('scrolling');
+                    }, 1000);
+
+                    const finalContent = finalEl.querySelector('.text-content');
+                    const currentText = finalContent.textContent;
+                    const newText = currentText + finalTranscript;
+                    finalContent.textContent = newText;
+                    checkOverflow(finalEl);
+
+                    if (finalClearTimer) clearTimeout(finalClearTimer);
+                    finalClearTimer = setTimeout(() => {
+                        finalEl.querySelector('.text-content').textContent = '';
+                        finalEl.classList.remove('scrolling');
+                    }, 5000);
+
+                    if (transSelect.value !== 'none') {
+                        const translated = await translateText(newText);
+                        if (translated) {
+                            const translationContent = translationEl.querySelector('.text-content');
+                            translationContent.textContent = translated;
+                            checkOverflow(translationEl);
+
+                            if (translationClearTimer) clearTimeout(translationClearTimer);
+                            translationClearTimer = setTimeout(() => {
+                                translationEl.querySelector('.text-content').textContent = '';
+                                translationEl.classList.remove('scrolling');
+                            }, 5000);
+                        }
+                    }
+                }
+            };
+
+            return recognition;
+        }
+
+        window.addEventListener('load', async () => {
+            console.log('[v2] ページ読み込み完了、初期化開始');
+
+            // プリセット初期化
+            setTimeout(() => {
+                const savedPreset = localStorage.getItem('selectedPreset');
+                if (savedPreset && presetSelect) {
+                    presetSelect.value = savedPreset;
+                    const event = new Event('change');
+                    presetSelect.dispatchEvent(event);
+                } else {
+                    presetSelect.value = 'default';
+                    const event = new Event('change');
+                    presetSelect.dispatchEvent(event);
+                }
+            }, 500);
+
+            // Translator APIチェックとUI調整
+            checkTranslationModel();
+
+            // 音声認識初期化
+            recognition = initSpeechRecognition();
+            if (!recognition) {
+                console.error('[v2] 音声認識初期化失敗');
+                return;
+            }
+
+            try {
+                recognition.start();
+                console.log('[v2] 音声認識開始成功');
+            } catch (error) {
+                console.error('[v2] 音声認識開始エラー:', error);
+            }
+
+            // 翻訳モデルチェック（API利用可能の場合のみ）
+            setTimeout(() => {
+                checkTranslationModel();
+            }, 2000);
+        });
+
+        recogSelect.addEventListener('change', (event) => {
+            if (recognition) {
+                recognition.lang = recogSelect.value;
+                if (isRecognizing) {
+                    recognition.stop();
+                    console.log('[v2] 音声認識停止（言語変更）');
+                    setTimeout(() => {
+                        if (recognition && !isRecognizing) {
+                            try {
+                                recognition.start();
+                                console.log('[v2] 音声認識再起動（言語変更）');
+                            } catch (error) {
+                                console.error('[v2] 音声認識再起動エラー（言語変更）:', error);
+                            }
+                        }
+                    }, 1500);
+                }
+            }
+            checkTranslationModel(event);
+        });
+
+        transSelect.addEventListener('change', (event) => {
+            checkTranslationModel(event);
+            localStorage.setItem('selectedPreset', presetSelect.value);
+        });
+
+        presetSelect.addEventListener('change', (event) => {
+            const preset = presetSelect.value;
+            if (preset === 'default') {
+                recogSelect.value = 'ja-JP';
+                transSelect.value = 'none';
+            } else if (preset === 'ja-en') {
+                recogSelect.value = 'ja-JP';
+                transSelect.value = 'en';
+            } else if (preset === 'en-zh') {
+                recogSelect.value = 'en-US';
+                transSelect.value = 'zh';
+            }
+            localStorage.setItem('selectedPreset', preset);
+            checkTranslationModel(event);
+            if (recognition) {
+                if (isRecognizing) {
+                    recognition.stop();
+                    console.log('[v2] 音声認識停止（プリセット変更）');
+                }
+                setTimeout(() => {
+                    if (recognition && !isRecognizing) {
+                        try {
+                            recognition.lang = recogSelect.value;
+                            recognition.start();
+                            console.log('[v2] 音声認識再起動（プリセット変更）');
+                        } catch (error) {
+                            console.error('[v2] 音声認識再起動エラー（プリセット変更）:', error);
+                        }
+                    }
+                }, 1500);
+            }
+        });
+
+        document.getElementById('preloadModelBtn').addEventListener('click', preloadTranslationModel);
+    </script>
+</body>
+</html>
